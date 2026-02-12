@@ -23,13 +23,38 @@ export default function SearchPanel({ files }) {
   const canSearch = useMemo(() => query.trim().length > 0 && files.length > 0, [query, files]);
 
   async function handleSearch() {
-    // frontend-only mock. Later you call your local backend.
-    setLoading(true);
-    setResults([]);
-    await new Promise((r) => setTimeout(r, 450));
-    setResults(MOCK_RESULTS);
+  setLoading(true);
+  setResults([]);
+
+  try {
+    const token = localStorage.getItem("auth_token");
+    const res = await fetch("/api/search", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ query, mode }), // mode: "exact" | "context"
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      // show backend error in UI
+      setResults([]);
+      console.error(data?.error || "Search failed");
+      setLoading(false);
+      return;
+    }
+
+    setResults(data.results || []);
+  } catch (e) {
+    console.error("Search server not reachable", e);
+  } finally {
     setLoading(false);
   }
+}
+
 
   return (
     <div className="rounded-2xl border border-zinc-200 bg-white p-5">
