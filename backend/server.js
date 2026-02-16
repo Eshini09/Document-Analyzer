@@ -7,6 +7,17 @@ import jwt from "jsonwebtoken";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import { execFile } from "child_process";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PDF_EXTRACT_SCRIPT = path.join(__dirname, "pdf_extract.py");
+
+console.log("PDF script path:", PDF_EXTRACT_SCRIPT);
+console.log("PDF script exists:", fs.existsSync(PDF_EXTRACT_SCRIPT));
+
+
 
 // -------------------- Config --------------------
 const PORT = 3001;
@@ -19,8 +30,8 @@ const OLLAMA_LLM_MODEL = process.env.OLLAMA_LLM_MODEL || "llama3.1:8b";
 const OLLAMA_EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text";
 
 // Uploads + session folders
-const uploadDir = path.resolve("./uploads");
-const sessionRoot = path.resolve("./tmp/sessions");
+const uploadDir = path.join(__dirname, "./uploads");
+const sessionRoot = path.join(__dirname, "./tmp/sessions");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 if (!fs.existsSync(sessionRoot)) fs.mkdirSync(sessionRoot, { recursive: true });
 
@@ -40,7 +51,7 @@ app.use(express.json());
 app.use(cors({ origin: FRONTEND_ORIGIN }));
 
 // -------------------- DB (permanent auth + file metadata) --------------------
-const db = new Database("./auth.db");
+const db = new Database(path.join(__dirname, "./auth.db"));
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -146,6 +157,24 @@ function sessionDbPath(userId) {
   return path.resolve(`${sessionRoot}/${userId}/index.db`);
 }
 
+function extractPdfPages(pdfPath) {
+  return new Promise((resolve, reject) => {
+    if (!fs.existsSync(PDF_EXTRACT_SCRIPT)) {
+      return reject(new Error(`pdf_extract.py not found at: ${PDF_EXTRACT_SCRIPT}`));
+    }
+
+    execFile("python3", [PDF_EXTRACT_SCRIPT, pdfPath], { cwd: __dirname }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message));
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e) {
+        reject(new Error("Failed to parse PDF extractor output: " + e.message));
+      }
+    });
+  });
+}
+
+
 function ensureSessionDb(userId) {
   const dir = sessionDir(userId);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -222,7 +251,7 @@ app.get("/api/me", requireAuth, (req, res) => {
   res.json({ id: req.user.sub, email: req.user.email });
 });
 
-// Upload + ingest (TXT only for now)
+// Upload + ingest (TXT + PDF)
 app.post("/api/upload", requireAuth, upload.array("files", 50), async (req, res) => {
   try {
     const uploaded = req.files || [];
@@ -245,6 +274,35 @@ app.post("/api/upload", requireAuth, upload.array("files", 50), async (req, res)
       const info = insertFile.run(f.originalname, f.filename, f.mimetype, f.size);
       const fileId = info.lastInsertRowid;
 
+      // ---- PDF ingest (FIXED: moved inside loop) ----
+      const isPdf =
+        f.mimetype === "application/pdf" ||
+        f.originalname.toLowerCase().endsWith(".pdf");
+
+      if (isPdf) {
+        const fullPath = path.join(uploadDir, f.filename);
+
+        const pages = await extractPdfPages(fullPath);
+        const nonEmpty = pages.filter(p => (p.text || "").trim().length > 0).length;
+        console.log("PDF pages:", pages.length, "nonempty:", nonEmpty);
+ // [{page, text}...]
+
+        for (const p of pages) {
+          const pageText = (p.text || "").trim();
+          if (!pageText) continue;
+
+          const chunks = chunkText(pageText, 1200, 150);
+
+          for (let i = 0; i < chunks.length; i++) {
+            const content = chunks[i];
+            const location = `Page ${p.page}`;
+            const emb = await ollamaEmbed(content);
+            insertChunk.run(f.originalname, location, content, JSON.stringify(emb));
+          }
+        }
+      }
+
+      // ---- TXT ingest (same as before) ----
       const isText =
         (f.mimetype && f.mimetype.startsWith("text/")) ||
         f.originalname.toLowerCase().endsWith(".txt");
